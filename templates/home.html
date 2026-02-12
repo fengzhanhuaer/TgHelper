@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+  <div class="top-actions">
+    <a class="ghost" href="{{ url_for('logout') }}">退出登录</a>
+  </div>
+  <h1>欢迎，{{ username }}</h1>
+  <p>您已成功登录。</p>
+{% endblock %}
