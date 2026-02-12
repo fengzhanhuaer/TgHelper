@@ -4,8 +4,13 @@
     <a class="ghost" href="{{ url_for('logout', token=token) }}">退出登录</a>
   </div>
   <h1>欢迎，{{ username }}</h1>
-  <p>已登录主页，可进入账号管理页面。</p>
-  <div style="margin-top: 12px;">
-    <a class="btn" href="{{ url_for('accounts', token=token) }}">管理 TG 账号</a>
+  <p>已登录主页，可快速进入常用功能。</p>
+  <div style="margin-top: 12px; display: grid; gap: 10px;">
+    <a class="btn" href="{{ url_for('api_settings', token=token) }}">设置 API</a>
+    <a class="btn" href="{{ url_for('proxy_settings', token=token) }}">设置代理</a>
+    <a class="btn" href="{{ url_for('database_settings', token=token) }}">数据库管理</a>
+    <a class="btn" href="{{ url_for('accounts', token=token) }}">管理帐号</a>
+    <a class="btn" href="{{ url_for('auto_send', token=token) }}">自动发送</a>
+    <a class="btn" href="{{ url_for('auto_reply', token=token) }}">自动回复</a>
   </div>
 {% endblock %}

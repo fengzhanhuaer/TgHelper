@@ -1,5 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
+  <div class="top-actions" style="justify-content: flex-start; gap: 8px;">
+    <a class="ghost" href="{{ url_for('home') }}">返回首页</a>
+  </div>
   <h1>用户登录</h1>
   <p>请输入账号和密码登录。</p>
   {% if error %}

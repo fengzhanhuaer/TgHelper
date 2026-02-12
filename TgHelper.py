@@ -1,27 +1,68 @@
 import os
 import sqlite3
 import asyncio
-import threading
-import webbrowser
 import socket
-from datetime import datetime
+import random
+import json
+from urllib import request as urlrequest
+from urllib import error as urlerror
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from secrets import token_urlsafe
 from flask import Flask, g, redirect, render_template, request, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 import socks
 from telethon import TelegramClient
 from telethon.errors import PhoneCodeInvalidError, SessionPasswordNeededError
 from telethon.sessions import StringSession
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "users.db"
+DB_PATH = BASE_DIR / "TgHelper.db"
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me")
 app.config["APP_NAME"] = "TgHelper"
 app.config["TELEGRAM_API_ID"] = os.environ.get("TELEGRAM_API_ID")
 app.config["TELEGRAM_API_HASH"] = os.environ.get("TELEGRAM_API_HASH")
+
+SCHEDULER = BackgroundScheduler(timezone="Asia/Shanghai")
+AUTO_SEND_JOB_ID = "auto_send_tick"
+AUTO_BACKUP_JOB_ID = "auto_backup_daily"
+
+APP_TABLES = [
+    "users",
+    "sessions",
+    "tg_accounts",
+    "tg_dialogs",
+    "tg_sign_tasks",
+    "tg_auto_send_tasks",
+    "tg_login_flows",
+    "app_settings",
+]
+
+UTC_PLUS_8 = timezone(timedelta(hours=8))
+
+
+def utc8_now() -> datetime:
+    return datetime.now(timezone.utc).astimezone(UTC_PLUS_8)
+
+
+def utc8_now_text() -> str:
+    return utc8_now().strftime("%Y-%m-%d %H:%M:%S UTC+8")
+
+
+def format_datetime_utc8(dt_value: datetime | None) -> str:
+    if not dt_value:
+        return utc8_now_text()
+    if dt_value.tzinfo is None:
+        dt_value = dt_value.replace(tzinfo=timezone.utc)
+    return dt_value.astimezone(UTC_PLUS_8).strftime("%Y-%m-%d %H:%M:%S UTC+8")
+
+
+def append_utc8_timestamp(message: str) -> str:
+    return f"{message}\n\n[{utc8_now_text()}]"
 
 
 def get_db():
@@ -69,6 +110,32 @@ def init_db():
         )
         """
     )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_dialogs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            dialog_id TEXT NOT NULL,
+            title TEXT,
+            username TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_sign_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            account_id INTEGER NOT NULL,
+            dialog_id TEXT NOT NULL,
+            message TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(owner, account_id)
+        )
+        """
+    )
+    ensure_auto_send_table(db)
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS tg_login_flows (
@@ -122,6 +189,75 @@ def delete_session_token(token: str) -> None:
     db = get_db()
     db.execute("DELETE FROM sessions WHERE token = ?", (token,))
     db.commit()
+
+
+def ensure_auto_send_table(db: sqlite3.Connection) -> None:
+    columns = db.execute("PRAGMA table_info(tg_auto_send_tasks)").fetchall()
+    if not columns:
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tg_auto_send_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner TEXT NOT NULL,
+                account_id INTEGER NOT NULL,
+                dialog_id TEXT NOT NULL,
+                message TEXT NOT NULL,
+                interval_seconds INTEGER NOT NULL,
+                jitter_seconds INTEGER NOT NULL,
+                schedule_type TEXT NOT NULL,
+                time_of_day TEXT,
+                enabled INTEGER NOT NULL,
+                next_run_at TEXT NOT NULL,
+                last_run_at TEXT,
+                last_result TEXT,
+                last_reply TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        return
+
+    column_names = {col[1] for col in columns}
+    if "last_reply" in column_names and "created_at" in column_names:
+        return
+
+    db.execute("ALTER TABLE tg_auto_send_tasks RENAME TO tg_auto_send_tasks_old")
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tg_auto_send_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner TEXT NOT NULL,
+            account_id INTEGER NOT NULL,
+            dialog_id TEXT NOT NULL,
+            message TEXT NOT NULL,
+            interval_seconds INTEGER NOT NULL,
+            jitter_seconds INTEGER NOT NULL,
+            schedule_type TEXT NOT NULL,
+            time_of_day TEXT,
+            enabled INTEGER NOT NULL,
+            next_run_at TEXT NOT NULL,
+            last_run_at TEXT,
+            last_result TEXT,
+            last_reply TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        INSERT INTO tg_auto_send_tasks (owner, account_id, dialog_id, message, interval_seconds, jitter_seconds, schedule_type, time_of_day, enabled, next_run_at, created_at, updated_at)
+        SELECT owner, account_id, dialog_id, message, interval_seconds, jitter_seconds,
+               COALESCE(schedule_type, 'interval') AS schedule_type,
+               time_of_day,
+               enabled, next_run_at,
+               COALESCE(updated_at, next_run_at) AS created_at,
+               COALESCE(updated_at, next_run_at) AS updated_at
+        FROM tg_auto_send_tasks_old
+        """
+    )
+    db.execute("DROP TABLE tg_auto_send_tasks_old")
 
 
 async def send_tg_login_code(phone: str) -> tuple[bool, str | None, str | None, str | None]:
@@ -187,6 +323,100 @@ async def complete_tg_login(phone: str, session_text: str, phone_code_hash: str,
     except Exception as exc:
         detail = f"{exc.__class__.__name__}: {exc}" if str(exc) else exc.__class__.__name__
         return False, f"登录失败：{detail}", None, None
+
+
+async def fetch_recent_dialogs(session_text: str, limit: int = 30) -> list[dict]:
+    api_id = app.config.get("TELEGRAM_API_ID")
+    api_hash = app.config.get("TELEGRAM_API_HASH")
+    if not api_id or not api_hash:
+        return []
+
+    client = TelegramClient(
+        StringSession(session_text),
+        int(api_id),
+        api_hash,
+        proxy=get_configured_proxy(),
+        connection_retries=1,
+        retry_delay=1,
+    )
+    dialogs = []
+    try:
+        await client.connect()
+        async for dialog in client.iter_dialogs(limit=limit):
+            entity = dialog.entity
+            dialogs.append(
+                {
+                    "dialog_id": str(dialog.id),
+                    "title": dialog.name,
+                    "username": getattr(entity, "username", None),
+                }
+            )
+    finally:
+        await client.disconnect()
+    return dialogs
+
+
+async def send_message_to_dialog(session_text: str, dialog_id: str, message: str) -> None:
+    api_id = app.config.get("TELEGRAM_API_ID")
+    api_hash = app.config.get("TELEGRAM_API_HASH")
+    if not api_id or not api_hash:
+        raise RuntimeError("API 未配置")
+
+    client = TelegramClient(
+        StringSession(session_text),
+        int(api_id),
+        api_hash,
+        proxy=get_configured_proxy(),
+        connection_retries=1,
+        retry_delay=1,
+    )
+    try:
+        await client.connect()
+        target = await resolve_dialog_target(client, dialog_id)
+        await client.send_message(target, append_utc8_timestamp(message))
+    finally:
+        await client.disconnect()
+
+
+async def send_and_fetch_reply(session_text: str, dialog_id: str, message: str) -> str | None:
+    api_id = app.config.get("TELEGRAM_API_ID")
+    api_hash = app.config.get("TELEGRAM_API_HASH")
+    if not api_id or not api_hash:
+        raise RuntimeError("API 未配置")
+
+    client = TelegramClient(
+        StringSession(session_text),
+        int(api_id),
+        api_hash,
+        proxy=get_configured_proxy(),
+        connection_retries=1,
+        retry_delay=1,
+    )
+    try:
+        await client.connect()
+        target = await resolve_dialog_target(client, dialog_id)
+        await client.send_message(target, append_utc8_timestamp(message))
+        await asyncio.sleep(2)
+        messages = await client.get_messages(target, limit=5)
+        for msg in messages:
+            if not msg.out:
+                reply_text = msg.message or ""
+                return f"[{format_datetime_utc8(msg.date)}] {reply_text}" if reply_text else f"[{format_datetime_utc8(msg.date)}]"
+        return None
+    finally:
+        await client.disconnect()
+
+
+async def resolve_dialog_target(client: TelegramClient, dialog_id: str):
+    # 优先通过最近会话匹配，避免直接按 ID 发送导致实体找不到(ValueError)
+    async for dialog in client.iter_dialogs(limit=200):
+        if str(dialog.id) == str(dialog_id):
+            return dialog.entity
+
+    try:
+        return int(dialog_id)
+    except ValueError:
+        return dialog_id
 
 
 def require_login():
@@ -262,7 +492,7 @@ def test_proxy_connection() -> tuple[bool, str]:
 def load_api_config():
     db = get_db()
     rows = db.execute(
-        "SELECT key, value FROM app_settings WHERE key IN ('telegram_api_id', 'telegram_api_hash', 'proxy_host', 'proxy_port', 'proxy_username', 'proxy_password')"
+        "SELECT key, value FROM app_settings WHERE key IN ('telegram_api_id', 'telegram_api_hash', 'proxy_host', 'proxy_port', 'proxy_username', 'proxy_password', 'cf_api_token', 'cf_account_id', 'cf_d1_database_name', 'cf_d1_database_id', 'cf_use_d1', 'db_auto_backup_enabled', 'db_auto_backup_time', 'db_auto_backup_last_date', 'db_auto_backup_last_result')"
     ).fetchall()
     data = {row["key"]: row["value"] for row in rows}
     app.config["TELEGRAM_API_ID"] = os.environ.get("TELEGRAM_API_ID") or data.get("telegram_api_id")
@@ -271,6 +501,15 @@ def load_api_config():
     app.config["PROXY_PORT"] = data.get("proxy_port")
     app.config["PROXY_USERNAME"] = data.get("proxy_username")
     app.config["PROXY_PASSWORD"] = data.get("proxy_password")
+    app.config["CF_API_TOKEN"] = data.get("cf_api_token")
+    app.config["CF_ACCOUNT_ID"] = data.get("cf_account_id")
+    app.config["CF_D1_DATABASE_NAME"] = data.get("cf_d1_database_name")
+    app.config["CF_D1_DATABASE_ID"] = data.get("cf_d1_database_id")
+    app.config["CF_USE_D1"] = data.get("cf_use_d1") == "1"
+    app.config["DB_AUTO_BACKUP_ENABLED"] = data.get("db_auto_backup_enabled") == "1"
+    app.config["DB_AUTO_BACKUP_TIME"] = data.get("db_auto_backup_time") or "03:30"
+    app.config["DB_AUTO_BACKUP_LAST_DATE"] = data.get("db_auto_backup_last_date") or ""
+    app.config["DB_AUTO_BACKUP_LAST_RESULT"] = data.get("db_auto_backup_last_result") or ""
 
 
 def run_async(coro):
@@ -283,6 +522,337 @@ def run_async(coro):
             return loop.run_until_complete(coro)
         finally:
             loop.close()
+
+
+def cloudflare_request(api_token: str, method: str, url: str, payload: dict | None = None) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json",
+    }
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urlrequest.Request(url=url, data=data, method=method, headers=headers)
+    try:
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urlerror.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore")
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {"success": False, "errors": [{"message": raw or str(exc)}]}
+    except Exception as exc:
+        return {"success": False, "errors": [{"message": str(exc)}]}
+
+
+def cloudflare_create_d1(api_token: str, account_id: str, db_name: str) -> tuple[bool, str, str | None]:
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database"
+    result = cloudflare_request(api_token, "POST", url, {"name": db_name})
+    if result.get("success") and result.get("result"):
+        db_id = result["result"].get("uuid") or result["result"].get("id")
+        return True, "D1 数据库创建成功。", db_id
+    errors = result.get("errors") or []
+    msg = errors[0].get("message") if errors else "创建失败"
+    return False, f"创建失败：{msg}", None
+
+
+def cloudflare_get_first_account(api_token: str) -> tuple[bool, str, str | None]:
+    url = "https://api.cloudflare.com/client/v4/accounts?page=1&per_page=1"
+    result = cloudflare_request(api_token, "GET", url)
+    if result.get("success") and isinstance(result.get("result"), list) and result["result"]:
+        account_id = result["result"][0].get("id")
+        if account_id:
+            return True, "已获取账号。", account_id
+    errors = result.get("errors") or []
+    msg = errors[0].get("message") if errors else "无法获取账号"
+    return False, f"获取账号失败：{msg}", None
+
+
+def cloudflare_test_token(api_token: str) -> tuple[bool, str, str | None]:
+    ok, msg, account_id = cloudflare_get_first_account(api_token)
+    if not ok or not account_id:
+        return False, msg, None
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database"
+    result = cloudflare_request(api_token, "GET", url)
+    if result.get("success"):
+        return True, "Cloudflare API 可用。", account_id
+    errors = result.get("errors") or []
+    err = errors[0].get("message") if errors else "测试失败"
+    return False, f"测试失败：{err}", account_id
+
+
+def cloudflare_find_d1_by_name(api_token: str, account_id: str, db_name: str) -> tuple[bool, str, str | None]:
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database"
+    result = cloudflare_request(api_token, "GET", url)
+    if result.get("success") and isinstance(result.get("result"), list):
+        for item in result["result"]:
+            if item.get("name") == db_name:
+                db_id = item.get("uuid") or item.get("id")
+                if db_id:
+                    return True, "已找到数据库。", db_id
+        return False, "未找到数据库。", None
+    errors = result.get("errors") or []
+    msg = errors[0].get("message") if errors else "查询失败"
+    return False, f"查询失败：{msg}", None
+
+
+def cloudflare_d1_query(api_token: str, account_id: str, db_id: str, sql: str, params: list | None = None) -> tuple[bool, list, str]:
+    url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{db_id}/query"
+    payload = {"sql": sql}
+    if params is not None:
+        payload["params"] = params
+    result = cloudflare_request(api_token, "POST", url, payload)
+    if result.get("success"):
+        statements = result.get("result") or []
+        rows = []
+        for st in statements:
+            if isinstance(st, dict) and st.get("success", True):
+                rows.extend(st.get("results") or [])
+            elif isinstance(st, dict):
+                err = st.get("error") or st.get("errors") or "query failed"
+                return False, [], str(err)
+        return True, rows, "ok"
+    errors = result.get("errors") or []
+    msg = errors[0].get("message") if errors else "query failed"
+    return False, [], msg
+
+
+def ensure_cloud_d1_schema(api_token: str, account_id: str, db_id: str, local_db: sqlite3.Connection) -> tuple[bool, str]:
+    for table in APP_TABLES:
+        row = local_db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if not row or not row[0]:
+            continue
+        ok, _, msg = cloudflare_d1_query(api_token, account_id, db_id, row[0])
+        if not ok:
+            lower_msg = (msg or "").lower()
+            if "already exists" in lower_msg:
+                continue
+            return False, f"创建云端表失败({table})：{msg}"
+    return True, "ok"
+
+
+def backup_local_to_d1(api_token: str, account_id: str, db_id: str, local_db: sqlite3.Connection) -> tuple[bool, str]:
+    ok, msg = ensure_cloud_d1_schema(api_token, account_id, db_id, local_db)
+    if not ok:
+        return False, msg
+
+    for table in APP_TABLES:
+        local_rows = local_db.execute(f"SELECT * FROM {table}").fetchall()
+        ok, _, emsg = cloudflare_d1_query(api_token, account_id, db_id, f"DELETE FROM {table}")
+        if not ok:
+            return False, f"清空云端表失败({table})：{emsg}"
+
+        if not local_rows:
+            continue
+
+        columns = local_rows[0].keys()
+        placeholders = ",".join(["?"] * len(columns))
+        sql = f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders})"
+        for row in local_rows:
+            params = [row[col] for col in columns]
+            ok, _, emsg = cloudflare_d1_query(api_token, account_id, db_id, sql, params)
+            if not ok:
+                return False, f"写入云端失败({table})：{emsg}"
+
+    return True, "本地数据库已备份到云端 D1。"
+
+
+def pull_d1_to_local(api_token: str, account_id: str, db_id: str, local_db: sqlite3.Connection) -> tuple[bool, str]:
+    ok, msg = ensure_cloud_d1_schema(api_token, account_id, db_id, local_db)
+    if not ok:
+        return False, msg
+
+    for table in APP_TABLES:
+        ok, rows, emsg = cloudflare_d1_query(api_token, account_id, db_id, f"SELECT * FROM {table}")
+        if not ok:
+            return False, f"读取云端失败({table})：{emsg}"
+
+        local_db.execute(f"DELETE FROM {table}")
+        if not rows:
+            continue
+
+        columns = list(rows[0].keys())
+        placeholders = ",".join(["?"] * len(columns))
+        sql = f"INSERT INTO {table} ({','.join(columns)}) VALUES ({placeholders})"
+        for row in rows:
+            local_db.execute(sql, [row.get(col) for col in columns])
+
+    local_db.commit()
+    return True, "云端 D1 数据已拉取到本地。"
+
+
+def process_daily_cloud_backup(conn: sqlite3.Connection) -> None:
+    settings_rows = conn.execute(
+        "SELECT key, value FROM app_settings WHERE key IN ('db_auto_backup_enabled', 'db_auto_backup_time', 'db_auto_backup_last_date', 'cf_api_token', 'cf_account_id', 'cf_d1_database_id')"
+    ).fetchall()
+    settings = {row["key"]: row["value"] for row in settings_rows}
+
+    if settings.get("db_auto_backup_enabled") != "1":
+        return
+
+    backup_time = settings.get("db_auto_backup_time") or "03:30"
+    if ":" not in backup_time:
+        return
+
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    if settings.get("db_auto_backup_last_date") == today:
+        return
+
+    try:
+        hh, mm = backup_time.split(":")
+        target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    except ValueError:
+        return
+
+    if now < target:
+        return
+
+    api_token = settings.get("cf_api_token") or ""
+    account_id = settings.get("cf_account_id") or ""
+    db_id = settings.get("cf_d1_database_id") or ""
+    if not api_token or not account_id or not db_id:
+        conn.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_auto_backup_last_result', ?)",
+            (f"{datetime.now().isoformat()} 自动备份失败：Cloudflare 配置不完整",),
+        )
+        conn.commit()
+        return
+
+    ok, message = backup_local_to_d1(api_token, account_id, db_id, conn)
+    conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_auto_backup_last_date', ?)", (today,))
+    conn.execute(
+        "INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_auto_backup_last_result', ?)",
+        (f"{datetime.now().isoformat()} {message}",),
+    )
+    conn.commit()
+
+
+def refresh_dialogs_for_account(account_id: int, session_text: str) -> None:
+    dialogs = run_async(fetch_recent_dialogs(session_text))
+    db = get_db()
+    db.execute("DELETE FROM tg_dialogs WHERE account_id = ?", (account_id,))
+    for item in dialogs:
+        db.execute(
+            "INSERT INTO tg_dialogs (account_id, dialog_id, title, username, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (account_id, item["dialog_id"], item["title"], item["username"], datetime.utcnow().isoformat()),
+        )
+    db.commit()
+
+
+def schedule_next_run(interval_seconds: int, jitter_seconds: int, schedule_type: str, time_of_day: str | None) -> str:
+    jitter = random.randint(0, max(jitter_seconds, 0))
+    now = datetime.now()
+
+    if schedule_type == "daily" and time_of_day:
+        try:
+            hour, minute = time_of_day.split(":")
+            target = now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+            if target <= now:
+                target = target + timedelta(days=1)
+            return (target + timedelta(seconds=jitter)).isoformat()
+        except ValueError:
+            pass
+
+    return (now + timedelta(seconds=interval_seconds + jitter)).isoformat()
+
+
+def process_auto_send_due_tasks() -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        now = datetime.now().isoformat()
+        tasks = conn.execute(
+            """
+            SELECT t.id, t.owner, t.account_id, t.dialog_id, t.message, t.interval_seconds, t.jitter_seconds,
+                   t.schedule_type, t.time_of_day, t.next_run_at, a.session_text
+            FROM tg_auto_send_tasks t
+            JOIN tg_accounts a ON a.id = t.account_id
+            WHERE t.enabled = 1 AND t.next_run_at <= ?
+            """,
+            (now,),
+        ).fetchall()
+
+        for task in tasks:
+            try:
+                reply = run_async(send_and_fetch_reply(task["session_text"], task["dialog_id"], task["message"]))
+                next_run = schedule_next_run(
+                    task["interval_seconds"],
+                    task["jitter_seconds"],
+                    task["schedule_type"],
+                    task["time_of_day"],
+                )
+                conn.execute(
+                    "UPDATE tg_auto_send_tasks SET next_run_at = ?, last_run_at = ?, last_result = ?, last_reply = ?, updated_at = ? WHERE id = ?",
+                    (
+                        next_run,
+                        datetime.now().isoformat(),
+                        f"sent [{utc8_now_text()}]",
+                        reply,
+                        datetime.now().isoformat(),
+                        task["id"],
+                    ),
+                )
+                conn.commit()
+            except Exception as exc:
+                next_run = schedule_next_run(
+                    task["interval_seconds"],
+                    task["jitter_seconds"],
+                    task["schedule_type"],
+                    task["time_of_day"],
+                )
+                detail = f"{exc.__class__.__name__}: {exc}" if str(exc) else exc.__class__.__name__
+                conn.execute(
+                    "UPDATE tg_auto_send_tasks SET next_run_at = ?, last_run_at = ?, last_result = ?, updated_at = ? WHERE id = ?",
+                    (
+                        next_run,
+                        datetime.now().isoformat(),
+                        f"failed [{utc8_now_text()}]: {detail}",
+                        datetime.now().isoformat(),
+                        task["id"],
+                    ),
+                )
+                conn.commit()
+    finally:
+        conn.close()
+
+
+def run_auto_send_job():
+    try:
+        process_auto_send_due_tasks()
+    except Exception:
+        pass
+
+
+def run_auto_backup_job():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        process_daily_cloud_backup(conn)
+    finally:
+        conn.close()
+
+
+def configure_scheduler_jobs():
+    if SCHEDULER.get_job(AUTO_SEND_JOB_ID) is None:
+        SCHEDULER.add_job(run_auto_send_job, CronTrigger(second="*/5"), id=AUTO_SEND_JOB_ID, replace_existing=True)
+
+    backup_time = app.config.get("DB_AUTO_BACKUP_TIME") or "03:30"
+    hour = 3
+    minute = 30
+    if ":" in backup_time:
+        try:
+            hh, mm = backup_time.split(":")
+            hour = int(hh)
+            minute = int(mm)
+        except ValueError:
+            hour, minute = 3, 30
+
+    if SCHEDULER.get_job(AUTO_BACKUP_JOB_ID):
+        SCHEDULER.remove_job(AUTO_BACKUP_JOB_ID)
+    SCHEDULER.add_job(run_auto_backup_job, CronTrigger(hour=hour, minute=minute), id=AUTO_BACKUP_JOB_ID, replace_existing=True)
 
 
 @app.before_request
@@ -394,6 +964,7 @@ def delete_account(account_id: int):
 def accounts():
     token = request.args.get("token")
     error = request.args.get("error")
+    selected_account_id = request.args.get("account_id")
     username = require_login()
     if not username:
         return redirect(url_for("login"))
@@ -404,12 +975,30 @@ def accounts():
         (username,),
     ).fetchall()
 
+    if not selected_account_id and accounts_list:
+        selected_account_id = str(accounts_list[0]["id"])
+
+    dialogs = []
+    sign_task = None
+    if selected_account_id:
+        dialogs = db.execute(
+            "SELECT dialog_id, title, username FROM tg_dialogs WHERE account_id = ? ORDER BY id DESC",
+            (selected_account_id,),
+        ).fetchall()
+        sign_task = db.execute(
+            "SELECT dialog_id, message FROM tg_sign_tasks WHERE owner = ? AND account_id = ?",
+            (username, selected_account_id),
+        ).fetchone()
+
     return render_template(
         "accounts.html",
         username=username,
         token=token,
         accounts=accounts_list,
         error=error,
+        selected_account_id=selected_account_id,
+        dialogs=dialogs,
+        sign_task=sign_task,
     )
 
 
@@ -484,6 +1073,423 @@ def proxy_settings():
         proxy_username=app.config.get("PROXY_USERNAME") or "",
         proxy_password=app.config.get("PROXY_PASSWORD") or "",
         message=message,
+    )
+
+
+@app.route("/settings/database", methods=["GET", "POST"])
+def database_settings():
+    token = request.args.get("token") or request.form.get("token")
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    message = None
+    db = get_db()
+    if request.method == "POST":
+        action = request.form.get("action", "save")
+        api_token = request.form.get("cf_api_token", "").strip()
+        account_id = app.config.get("CF_ACCOUNT_ID") or ""
+        db_name = "TgHelper"
+        db_id = app.config.get("CF_D1_DATABASE_ID") or ""
+        use_d1 = app.config.get("CF_USE_D1") or False
+
+        if action == "create":
+            if not api_token:
+                message = "请先填写 API Token。"
+            else:
+                ok, message, resolved_account_id = cloudflare_test_token(api_token)
+                if resolved_account_id:
+                    account_id = resolved_account_id
+                    ok_find, _, found_db_id = cloudflare_find_d1_by_name(api_token, account_id, db_name)
+                    if ok_find and found_db_id:
+                        db_id = found_db_id
+                        message = "已找到云端数据库 TgHelper。"
+                        use_d1 = True
+                    else:
+                        ok_create, msg, created_id = cloudflare_create_d1(api_token, account_id, db_name)
+                        message = msg
+                        if ok_create and created_id:
+                            db_id = created_id
+                            use_d1 = True
+        elif action == "backup":
+            if not api_token:
+                message = "请先填写 API Token。"
+            else:
+                ok, msg, resolved_account_id = cloudflare_test_token(api_token)
+                if not ok or not resolved_account_id:
+                    message = msg
+                else:
+                    account_id = resolved_account_id
+                    ok_find, _, found_db_id = cloudflare_find_d1_by_name(api_token, account_id, db_name)
+                    if not ok_find or not found_db_id:
+                        message = "未找到云端数据库 TgHelper，请先创建。"
+                    else:
+                        db_id = found_db_id
+                        ok_bak, msg_bak = backup_local_to_d1(api_token, account_id, db_id, db)
+                        message = msg_bak
+                        use_d1 = ok_bak
+        elif action == "pull":
+            if not api_token:
+                message = "请先填写 API Token。"
+            else:
+                ok, msg, resolved_account_id = cloudflare_test_token(api_token)
+                if not ok or not resolved_account_id:
+                    message = msg
+                else:
+                    account_id = resolved_account_id
+                    ok_find, _, found_db_id = cloudflare_find_d1_by_name(api_token, account_id, db_name)
+                    if not ok_find or not found_db_id:
+                        message = "未找到云端数据库 TgHelper，请先创建。"
+                    else:
+                        db_id = found_db_id
+                        ok_pull, msg_pull = pull_d1_to_local(api_token, account_id, db_id, db)
+                        message = msg_pull
+                        use_d1 = ok_pull
+        elif action == "auto_backup":
+            auto_enabled = request.form.get("db_auto_backup_enabled") == "on"
+            auto_time = request.form.get("db_auto_backup_time", "03:30").strip()
+            if ":" not in auto_time:
+                message = "自动备份时间格式不正确，应为 HH:MM。"
+            else:
+                db.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_auto_backup_enabled', ?)", ("1" if auto_enabled else "0",))
+                db.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('db_auto_backup_time', ?)", (auto_time,))
+                db.commit()
+                load_api_config()
+                if SCHEDULER.running:
+                    configure_scheduler_jobs()
+                message = "自动备份设置已保存。"
+        else:
+            if not api_token:
+                message = "请先填写 API Token。"
+            else:
+                message = "已保存。"
+
+        if api_token:
+            db.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('cf_api_token', ?)", (api_token,))
+            db.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('cf_account_id', ?)", (account_id,))
+            db.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('cf_d1_database_name', ?)", (db_name,))
+            db.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('cf_d1_database_id', ?)", (db_id,))
+            db.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES ('cf_use_d1', ?)", ("1" if use_d1 else "0",))
+            db.commit()
+            load_api_config()
+
+    load_api_config()
+
+    return render_template(
+        "database_settings.html",
+        token=token,
+        message=message,
+        cf_api_token=app.config.get("CF_API_TOKEN") or "",
+        cf_d1_database_name="TgHelper",
+        cf_d1_database_id=app.config.get("CF_D1_DATABASE_ID") or "",
+        cf_use_d1=app.config.get("CF_USE_D1") or False,
+        db_auto_backup_enabled=app.config.get("DB_AUTO_BACKUP_ENABLED") or False,
+        db_auto_backup_time=app.config.get("DB_AUTO_BACKUP_TIME") or "03:30",
+        db_auto_backup_last_result=app.config.get("DB_AUTO_BACKUP_LAST_RESULT") or "",
+    )
+
+
+@app.route("/auto/send")
+def auto_send():
+    token = request.args.get("token")
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+    return render_template("auto_send.html", token=token)
+
+
+@app.route("/auto/reply")
+def auto_reply():
+    token = request.args.get("token")
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+    return render_template("auto_reply.html", token=token)
+
+
+@app.route("/auto/send/new")
+def auto_send_new():
+    token = request.args.get("token")
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    selected_account_id = request.args.get("account_id")
+    db = get_db()
+    accounts_list = db.execute(
+        "SELECT id, account_name FROM tg_accounts WHERE owner = ? ORDER BY id DESC",
+        (username,),
+    ).fetchall()
+
+    if not selected_account_id and accounts_list:
+        selected_account_id = str(accounts_list[0]["id"])
+
+    dialogs = []
+    if selected_account_id:
+        dialogs = db.execute(
+            "SELECT dialog_id, title, username FROM tg_dialogs WHERE account_id = ? ORDER BY id DESC",
+            (selected_account_id,),
+        ).fetchall()
+
+    return render_template(
+        "auto_send_new.html",
+        token=token,
+        accounts=accounts_list,
+        selected_account_id=selected_account_id,
+        dialogs=dialogs,
+        error=request.args.get("error"),
+    )
+
+
+@app.route("/auto/send/manage")
+def auto_send_manage():
+    token = request.args.get("token")
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    selected_account_id = request.args.get("account_id")
+    db = get_db()
+    accounts_list = db.execute(
+        "SELECT id, account_name FROM tg_accounts WHERE owner = ? ORDER BY id DESC",
+        (username,),
+    ).fetchall()
+
+    if not selected_account_id and accounts_list:
+        selected_account_id = str(accounts_list[0]["id"])
+
+    tasks = []
+    if selected_account_id:
+        tasks = db.execute(
+            """
+             SELECT t.id, t.dialog_id, t.message, t.interval_seconds, t.jitter_seconds, t.schedule_type, t.time_of_day,
+                 t.enabled, t.last_run_at, t.last_result, t.last_reply,
+                 COALESCE(d.title, d.username, t.dialog_id) AS dialog_name
+             FROM tg_auto_send_tasks t
+             LEFT JOIN tg_dialogs d ON d.account_id = t.account_id AND d.dialog_id = t.dialog_id
+             WHERE t.owner = ? AND t.account_id = ?
+                 ORDER BY t.id DESC
+            """,
+            (username, selected_account_id),
+        ).fetchall()
+
+    return render_template(
+        "auto_send_manage.html",
+        token=token,
+        accounts=accounts_list,
+        selected_account_id=selected_account_id,
+        tasks=tasks,
+        error=request.args.get("error"),
+        message=request.args.get("message"),
+    )
+
+
+@app.route("/auto/send/refresh", methods=["POST"])
+def auto_send_refresh_dialogs():
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    token = request.form.get("token")
+    account_id = request.form.get("account_id")
+    if not account_id:
+        return redirect(url_for("auto_send_new", token=token, error="请选择账号。") if token else url_for("auto_send_new", error="请选择账号。"))
+
+    db = get_db()
+    account = db.execute(
+        "SELECT id, session_text FROM tg_accounts WHERE id = ? AND owner = ?",
+        (account_id, username),
+    ).fetchone()
+    if not account:
+        return redirect(url_for("auto_send_new", token=token, error="账号不存在。") if token else url_for("auto_send_new", error="账号不存在。"))
+
+    refresh_dialogs_for_account(account["id"], account["session_text"])
+    return redirect(
+        url_for("auto_send_new", token=token, account_id=account_id)
+        if token
+        else url_for("auto_send_new", account_id=account_id)
+    )
+
+
+@app.route("/auto/send/save", methods=["POST"])
+def auto_send_save():
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    token = request.form.get("token")
+    account_id = request.form.get("account_id")
+    dialog_id = request.form.get("dialog_id")
+    message_text = request.form.get("message", "").strip()
+    jitter_seconds = request.form.get("jitter_seconds", "0").strip()
+    schedule_type = "daily"
+    time_of_day = request.form.get("time_of_day", "").strip()
+    enabled = request.form.get("enabled") == "on"
+
+    if not account_id or not dialog_id or not message_text:
+        return redirect(url_for("auto_send_new", token=token, error="请选择账号与会话，并填写内容。") if token else url_for("auto_send_new", error="请选择账号与会话，并填写内容。"))
+
+    try:
+        jitter_value = int(jitter_seconds) if jitter_seconds else 0
+        if jitter_value < 0:
+            raise ValueError
+    except ValueError:
+        return redirect(url_for("auto_send_new", token=token, error="随机延时填写不正确。") if token else url_for("auto_send_new", error="随机延时填写不正确。"))
+
+    if not time_of_day or ":" not in time_of_day:
+        return redirect(url_for("auto_send_new", token=token, error="请填写每天的时间点，例如 09:30。") if token else url_for("auto_send_new", error="请填写每天的时间点，例如 09:30。"))
+    interval_value = 86400
+
+    next_run = schedule_next_run(interval_value, jitter_value, schedule_type, time_of_day)
+    db = get_db()
+    now_str = datetime.now().isoformat()
+    db.execute(
+        """
+        INSERT INTO tg_auto_send_tasks (owner, account_id, dialog_id, message, interval_seconds, jitter_seconds, schedule_type, time_of_day, enabled, next_run_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            username,
+            account_id,
+            dialog_id,
+            message_text,
+            interval_value,
+            jitter_value,
+            schedule_type,
+            time_of_day,
+            1 if enabled else 0,
+            next_run,
+            now_str,
+            now_str,
+        ),
+    )
+    db.commit()
+
+    return redirect(
+        url_for("auto_send_manage", token=token, account_id=account_id, message="已保存。")
+        if token
+        else url_for("auto_send_manage", account_id=account_id, message="已保存。")
+    )
+
+
+@app.route("/auto/send/delete/<int:task_id>", methods=["POST"])
+def auto_send_delete(task_id: int):
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    token = request.form.get("token")
+    account_id = request.form.get("account_id")
+    db = get_db()
+    db.execute("DELETE FROM tg_auto_send_tasks WHERE id = ? AND owner = ?", (task_id, username))
+    db.commit()
+    return redirect(
+        url_for("auto_send_manage", token=token, account_id=account_id)
+        if token
+        else url_for("auto_send_manage", account_id=account_id)
+    )
+
+
+@app.route("/auto/send/update/<int:task_id>", methods=["POST"])
+def auto_send_update(task_id: int):
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    token = request.form.get("token")
+    account_id = request.form.get("account_id")
+    message_text = request.form.get("message", "").strip()
+    time_of_day = request.form.get("time_of_day", "").strip()
+    jitter_seconds = request.form.get("jitter_seconds", "0").strip()
+    if not message_text:
+        return redirect(
+            url_for("auto_send_manage", token=token, account_id=account_id, error="发送内容不能为空。")
+            if token
+            else url_for("auto_send_manage", account_id=account_id, error="发送内容不能为空。")
+        )
+
+    if not time_of_day or ":" not in time_of_day:
+        return redirect(
+            url_for("auto_send_manage", token=token, account_id=account_id, error="时间格式不正确，应为 HH:MM。")
+            if token
+            else url_for("auto_send_manage", account_id=account_id, error="时间格式不正确，应为 HH:MM。")
+        )
+
+    try:
+        hh, mm = time_of_day.split(":")
+        hh_value = int(hh)
+        mm_value = int(mm)
+        if hh_value < 0 or hh_value > 23 or mm_value < 0 or mm_value > 59:
+            raise ValueError
+        jitter_value = int(jitter_seconds) if jitter_seconds else 0
+        if jitter_value < 0:
+            raise ValueError
+    except ValueError:
+        return redirect(
+            url_for("auto_send_manage", token=token, account_id=account_id, error="时间或随机延时填写不正确。")
+            if token
+            else url_for("auto_send_manage", account_id=account_id, error="时间或随机延时填写不正确。")
+        )
+
+    interval_value = 86400
+    next_run = schedule_next_run(interval_value, jitter_value, "daily", time_of_day)
+
+    db = get_db()
+    db.execute(
+        "UPDATE tg_auto_send_tasks SET message = ?, time_of_day = ?, jitter_seconds = ?, interval_seconds = ?, schedule_type = ?, next_run_at = ?, updated_at = ? WHERE id = ? AND owner = ?",
+        (message_text, time_of_day, jitter_value, interval_value, "daily", next_run, datetime.now().isoformat(), task_id, username),
+    )
+    db.commit()
+    return redirect(
+        url_for("auto_send_manage", token=token, account_id=account_id, message="任务内容与计划已更新。")
+        if token
+        else url_for("auto_send_manage", account_id=account_id, message="任务内容与计划已更新。")
+    )
+
+
+@app.route("/auto/send/run/<int:task_id>", methods=["POST"])
+def auto_send_run(task_id: int):
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    token = request.form.get("token")
+    account_id = request.form.get("account_id")
+    db = get_db()
+    task = db.execute(
+        """
+        SELECT t.id, t.dialog_id, t.message, a.session_text
+        FROM tg_auto_send_tasks t
+        JOIN tg_accounts a ON a.id = t.account_id
+        WHERE t.id = ? AND t.owner = ?
+        """,
+        (task_id, username),
+    ).fetchone()
+
+    if not task:
+        return redirect(url_for("auto_send_manage", token=token, error="任务不存在。") if token else url_for("auto_send_manage", error="任务不存在。"))
+
+    try:
+        reply = run_async(send_and_fetch_reply(task["session_text"], task["dialog_id"], task["message"]))
+        db.execute(
+            "UPDATE tg_auto_send_tasks SET last_run_at = ?, last_result = ?, last_reply = ?, updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), f"sent [{utc8_now_text()}]", reply, datetime.now().isoformat(), task_id),
+        )
+        db.commit()
+        msg = "已发送。"
+    except Exception as exc:
+        detail = f"{exc.__class__.__name__}: {exc}" if str(exc) else exc.__class__.__name__
+        db.execute(
+            "UPDATE tg_auto_send_tasks SET last_run_at = ?, last_result = ?, updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), f"failed [{utc8_now_text()}]: {detail}", datetime.now().isoformat(), task_id),
+        )
+        db.commit()
+        msg = "发送失败。"
+
+    return redirect(
+        url_for("auto_send_manage", token=token, account_id=account_id, message=msg)
+        if token
+        else url_for("auto_send_manage", account_id=account_id, message=msg)
     )
 
 
@@ -566,21 +1572,85 @@ def tg_login_verify():
         )
 
     account_name = flow["account_name"] or display_name or flow["phone"]
-    db.execute(
+    final_session_text = final_session or flow["session_text"]
+    cur = db.execute(
         "INSERT INTO tg_accounts (owner, account_name, session_text, created_at) VALUES (?, ?, ?, ?)",
-        (username, account_name, final_session or flow["session_text"], datetime.utcnow().isoformat()),
+        (username, account_name, final_session_text, datetime.utcnow().isoformat()),
     )
+    account_id = cur.lastrowid
     db.execute("DELETE FROM tg_login_flows WHERE id = ? AND owner = ?", (flow_id, username))
     db.commit()
+    if account_id:
+        refresh_dialogs_for_account(account_id, final_session_text)
     return redirect(url_for("accounts", token=token) if token else url_for("accounts"))
 
 
-if __name__ == "__main__":
-    def _open_browser():
-        webbrowser.open("http://127.0.0.1:15018/")
+@app.route("/tg/dialogs/refresh", methods=["POST"])
+def tg_refresh_dialogs():
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
 
+    token = request.form.get("token")
+    account_id = request.form.get("account_id")
+    if not account_id:
+        return redirect(url_for("accounts", token=token, error="请选择账号。") if token else url_for("accounts", error="请选择账号。"))
+
+    db = get_db()
+    account = db.execute(
+        "SELECT id, session_text FROM tg_accounts WHERE id = ? AND owner = ?",
+        (account_id, username),
+    ).fetchone()
+    if not account:
+        return redirect(url_for("accounts", token=token, error="账号不存在。") if token else url_for("accounts", error="账号不存在。"))
+
+    refresh_dialogs_for_account(account["id"], account["session_text"])
+    return redirect(
+        url_for("accounts", token=token, account_id=account_id)
+        if token
+        else url_for("accounts", account_id=account_id)
+    )
+
+
+@app.route("/tg/sign/save", methods=["POST"])
+def tg_save_sign_task():
+    username = require_login()
+    if not username:
+        return redirect(url_for("login"))
+
+    token = request.form.get("token")
+    account_id = request.form.get("account_id")
+    dialog_id = request.form.get("dialog_id")
+    message = request.form.get("message", "").strip()
+    if not account_id or not dialog_id:
+        return redirect(url_for("accounts", token=token, error="请选择账号和会话。") if token else url_for("accounts", error="请选择账号和会话。"))
+
+    db = get_db()
+    db.execute(
+        """
+        INSERT INTO tg_sign_tasks (owner, account_id, dialog_id, message, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(owner, account_id)
+        DO UPDATE SET dialog_id = excluded.dialog_id, message = excluded.message, created_at = excluded.created_at
+        """,
+        (username, account_id, dialog_id, message, datetime.utcnow().isoformat()),
+    )
+    db.commit()
+    return redirect(
+        url_for("accounts", token=token, account_id=account_id)
+        if token
+        else url_for("accounts", account_id=account_id)
+    )
+
+
+if __name__ == "__main__":
     is_dev = os.environ.get("TGHELPER_DEV") == "1"
     if not is_dev or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
-        threading.Timer(0.8, _open_browser).start()
+        with app.app_context():
+            init_db()
+            load_api_config()
+            configure_scheduler_jobs()
+        if not SCHEDULER.running:
+            SCHEDULER.start()
 
     app.run(host="0.0.0.0", port=15018, debug=is_dev, use_reloader=is_dev)

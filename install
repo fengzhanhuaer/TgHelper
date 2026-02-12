@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "[ERROR] 该脚本仅支持 Linux。"
+  exit 1
+fi
+
+SUDO=""
+if [[ "${EUID}" -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    echo "[ERROR] 需要 root 权限或 sudo。"
+    exit 1
+  fi
+fi
+
+install_python_runtime() {
+  if command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[INFO] 未检测到 python3，尝试自动安装..."
+  if command -v apt-get >/dev/null 2>&1; then
+    $SUDO apt-get update
+    $SUDO apt-get install -y python3 python3-venv python3-pip
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf install -y python3 python3-pip
+  elif command -v yum >/dev/null 2>&1; then
+    $SUDO yum install -y python3 python3-pip
+  elif command -v pacman >/dev/null 2>&1; then
+    $SUDO pacman -Sy --noconfirm python python-pip
+  else
+    echo "[ERROR] 无法识别包管理器，请手动安装 python3。"
+    exit 1
+  fi
+}
+
+install_python_runtime
+
+if [[ ! -d ".venv" ]]; then
+  echo "[INFO] 创建虚拟环境 .venv"
+  python3 -m venv .venv
+fi
+
+PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "[ERROR] 虚拟环境 Python 不可用: $PYTHON_BIN"
+  exit 1
+fi
+
+echo "[INFO] 安装依赖..."
+"$PYTHON_BIN" -m pip install --upgrade pip
+"$PYTHON_BIN" -m pip install -r "$SCRIPT_DIR/requirements.txt"
+
+echo "[INFO] 注册并启动 systemd 服务..."
+SERVICE_FILE="/etc/systemd/system/tghelper.service"
+
+$SUDO tee "$SERVICE_FILE" >/dev/null <<EOF
+[Unit]
+Description=TgHelper Web Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=$PYTHON_BIN $SCRIPT_DIR/TgHelper.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable --now tghelper.service
+
+echo "[OK] 安装完成。"
+echo "[TIP] 查看状态: systemctl status tghelper.service"
+echo "[TIP] 查看日志: journalctl -u tghelper.service -f"

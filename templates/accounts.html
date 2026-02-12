@@ -2,8 +2,6 @@
 {% block content %}
   <div class="top-actions" style="justify-content: flex-start; gap: 8px;">
     <a class="ghost" href="{{ url_for('home', token=token) }}">返回首页</a>
-    <a class="ghost" href="{{ url_for('api_settings', token=token) }}">设置 API</a>
-    <a class="ghost" href="{{ url_for('proxy_settings', token=token) }}">设置代理</a>
     <a class="ghost" href="{{ url_for('logout', token=token) }}">退出登录</a>
   </div>
   <h1>账号管理</h1>
@@ -26,7 +24,7 @@
     <button class="btn" type="submit">手机登录</button>
   </form>
 
-  <div style="margin-top: 18px;">
+  <div id="auto-sign" style="margin-top: 18px;">
     <h2 style="font-size: 16px; margin: 0 0 10px;">已保存账号</h2>
     {% if accounts %}
       {% for account in accounts %}
@@ -45,4 +43,5 @@
       <p style="color:#6b7280;">暂无账号，请先添加。</p>
     {% endif %}
   </div>
+
 {% endblock %}

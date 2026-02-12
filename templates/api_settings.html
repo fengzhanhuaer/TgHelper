@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
   <div class="top-actions" style="justify-content: flex-start; gap: 8px;">
-    <a class="ghost" href="{{ url_for('accounts', token=token) }}">返回账号管理</a>
+    <a class="ghost" href="{{ url_for('home', token=token) }}">返回首页</a>
     <a class="ghost" href="{{ url_for('logout', token=token) }}">退出登录</a>
   </div>
   <h1>Telegram API 设置</h1>
