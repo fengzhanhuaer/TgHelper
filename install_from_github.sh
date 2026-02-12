@@ -63,9 +63,15 @@ install_tool_if_missing bash bash bash bash bash
 
 if [[ -d "$TARGET_DIR/.git" ]]; then
   echo "[INFO] 检测到已存在仓库，执行更新: $TARGET_DIR"
-  $SUDO git -C "$TARGET_DIR" fetch --all --prune
-  $SUDO git -C "$TARGET_DIR" checkout "$BRANCH"
-  $SUDO git -C "$TARGET_DIR" pull --ff-only origin "$BRANCH"
+  $SUDO git -C "$TARGET_DIR" remote set-url origin "$REPO_URL"
+  $SUDO git -C "$TARGET_DIR" fetch origin "$BRANCH" --prune
+  if $SUDO git -C "$TARGET_DIR" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    $SUDO git -C "$TARGET_DIR" checkout "$BRANCH"
+  else
+    $SUDO git -C "$TARGET_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
+  fi
+  $SUDO git -C "$TARGET_DIR" reset --hard "origin/$BRANCH"
+  $SUDO git -C "$TARGET_DIR" clean -fd
 else
   echo "[INFO] 克隆仓库到: $TARGET_DIR"
   $SUDO mkdir -p "$(dirname "$TARGET_DIR")"

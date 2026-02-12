@@ -13,73 +13,29 @@ TgHelper 是一个基于 Flask + SQLite + Telethon 的 Telegram 管理工具，�
 
 ---
 
-## 1. 从 GitHub 拉取代码
+## 1. 安装
 
-### 首次克隆
+## Linux（一键安装：自动拉取最新 Git + 安装服务）
 
-```bash
-git clone https://github.com/fengzhanhuaer/TgHelper.git
-cd TgHelper
-```
+仓库内提供了引导脚本 [install_from_github.sh](install_from_github.sh)，可自动完成：
 
-### 已有项目更新
-
-```bash
-git pull
-```
-
----
-
-## 2. 安装
-
-## Linux（一键安装 + 注册后台服务）
-
-项目内置安装脚本 [install](install)。
-
-```bash
-cd TgHelper
-chmod +x install
-./install
-```
-
-脚本会自动完成：
-
-- 安装 Python（缺失时）
-- 创建 `.venv`
-- 安装依赖
+- 从 GitHub 拉取/更新仓库（自动同步到指定分支最新代码）
+- 执行项目安装脚本
 - 注册并启动 `tghelper.service`
+
+一键安装命令（自动下载脚本并在本地执行）：
+
+```bash
+curl -fsSL -o install_from_github.sh https://raw.githubusercontent.com/fengzhanhuaer/TgHelper/main/install_from_github.sh && chmod +x install_from_github.sh && ./install_from_github.sh https://github.com/fengzhanhuaer/TgHelper.git main /opt/TgHelper
+```
+
+重复执行同一命令即可自动拉取最新代码并完成更新。
 
 常用命令：
 
 ```bash
 systemctl status tghelper.service
 journalctl -u tghelper.service -f
-```
-
-## Linux（从 GitHub 一键拉取 + 安装 + 注册服务）
-
-仓库内提供了引导脚本 [install_from_github.sh](install_from_github.sh)，可自动完成：
-
-- 从 GitHub 拉取/更新仓库
-- 执行项目安装脚本
-- 注册并启动 `tghelper.service`
-
-用法：
-
-```bash
-bash install_from_github.sh <repo_url> [branch] [target_dir]
-```
-
-示例：
-
-```bash
-bash install_from_github.sh https://github.com/fengzhanhuaer/TgHelper.git main /opt/TgHelper
-```
-
-如果你希望“只用一条命令”安装，建议先下载到本地再执行本地脚本：
-
-```bash
-curl -fsSL -o install_from_github.sh https://raw.githubusercontent.com/fengzhanhuaer/TgHelper/main/install_from_github.sh && chmod +x install_from_github.sh && ./install_from_github.sh https://github.com/fengzhanhuaer/TgHelper.git main /opt/TgHelper
 ```
 
 ## Windows（本地运行）
@@ -97,7 +53,7 @@ cd D:\100.Working\GithubWork\TgHelper
 
 ---
 
-## 3. 手动安装依赖（可选）
+## 2. 手动安装依赖（可选）
 
 如果你不使用 Linux 一键脚本，也可以手动安装：
 
@@ -113,7 +69,7 @@ pip install -r requirements.txt
 
 ---
 
-## 4. 使用方法
+## 3. 使用方法
 
 1. 启动服务后，打开 http://127.0.0.1:15018
 2. 首次进入先注册本地管理员账号
@@ -128,7 +84,7 @@ pip install -r requirements.txt
 
 ---
 
-## 5. 目录说明
+## 4. 目录说明
 
 - [TgHelper.py](TgHelper.py)：主程序入口与全部后端逻辑
 - [templates](templates)：前端模板
@@ -139,7 +95,7 @@ pip install -r requirements.txt
 
 ---
 
-## 6. 备注
+## 5. 备注
 
 - 本地数据库文件名为 `TgHelper.db`
 - 端口默认 15018

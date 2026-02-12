@@ -40,7 +40,31 @@ install_python_runtime() {
   fi
 }
 
+update_repo_if_possible() {
+  if [[ ! -d "$SCRIPT_DIR/.git" ]]; then
+    return 0
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local current_branch
+  current_branch="$(git -C "$SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [[ -z "$current_branch" || "$current_branch" == "HEAD" ]]; then
+    return 0
+  fi
+
+  if ! git -C "$SCRIPT_DIR" remote get-url origin >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "[INFO] 检测到 Git 仓库，尝试更新最新代码($current_branch)..."
+  git -C "$SCRIPT_DIR" fetch origin "$current_branch" --prune || return 0
+  git -C "$SCRIPT_DIR" pull --ff-only origin "$current_branch" || return 0
+}
+
 install_python_runtime
+update_repo_if_possible
 
 if [[ ! -d ".venv" ]]; then
   echo "[INFO] 创建虚拟环境 .venv"
